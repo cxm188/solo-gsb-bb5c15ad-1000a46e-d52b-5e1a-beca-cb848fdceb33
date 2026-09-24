@@ -95,6 +95,53 @@ def departure_windows(
     return result, earliest
 
 
+def earliest_scheduled_departure(
+    departable_windows: list[tuple[datetime, datetime]],
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+    blockers: list[tuple[datetime, datetime]],
+) -> datetime | None:
+    """在潮汐可出发时段内、请求允许范围内，安排不与已有预约重叠的最早出发时刻。
+
+    - departable_windows：departure_windows 求出的可出发时段 [s, e]
+      （出发时刻 d ∈ [s, e] 即可保证整个通航过程 [d, d+时长] 水深达标）；
+    - allowed_start/end：请求方允许的出发时刻范围（含端点）；
+    - blockers：该港口已有有效预约的通航占用区间 [占用起点, 占用终点]；
+      首尾相接允许（新区间端点恰好贴住已有区间不算重叠）。
+
+    返回最早可出发时刻（UTC datetime）；无可用时刻返回 None。
+    """
+    range_lo, range_hi = allowed_start.timestamp(), allowed_end.timestamp()
+
+    # 候选出发区间 = 潮汐可出发时段 ∩ 请求允许范围
+    candidates: list[tuple[float, float]] = []
+    for start, end in departable_windows:
+        lo = max(start.timestamp(), range_lo)
+        hi = min(end.timestamp(), range_hi)
+        if lo <= hi:
+            candidates.append((lo, hi))
+
+    # 已有占用 [a, b] 会禁止 d ∈ (a-时长, b)：d == a-时长（首尾相接）
+    # 与 d == b（紧随其后）均允许，因此从候选区间中挖掉开区间、保留两个端点。
+    for occ_start, occ_end in sorted(blockers, key=lambda x: x[0].timestamp()):
+        forbidden_lo = occ_start.timestamp() - duration_seconds
+        forbidden_hi = occ_end.timestamp()
+        remaining: list[tuple[float, float]] = []
+        for lo, hi in candidates:
+            if lo <= forbidden_lo:  # 左侧 [lo, forbidden_lo] 可出发（含相接端点）
+                remaining.append((lo, min(hi, forbidden_lo)))
+            if hi >= forbidden_hi:  # 右侧 [forbidden_hi, hi] 可出发（含相接端点）
+                remaining.append((max(lo, forbidden_hi), hi))
+        candidates = remaining
+        if not candidates:
+            return None
+
+    if not candidates:
+        return None
+    return _to_utc(min(lo for lo, _ in candidates))
+
+
 def _to_utc(ts: float) -> datetime:
     """Unix 秒转 UTC datetime，四舍五入到整秒避免浮点噪声。"""
     return datetime.fromtimestamp(round(ts), tz=timezone.utc)

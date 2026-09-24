@@ -1,6 +1,6 @@
-# 港口潮汐通航窗口 API
+# 港口潮汐通航窗口与单向航道预约 API
 
-基于 **Python + FastAPI + SQLite** 的港口潮汐通航窗口计算服务。
+基于 **Python + FastAPI + SQLite** 的港口潮汐通航窗口计算与单向航道预约服务。
 
 - 录入港口的**潮高预报点**与**航道基准水深**；
 - 船舶提交**吃水**、**安全富余**和**正数通航时长**；
@@ -8,7 +8,11 @@
   `水深 = 基准水深 + 潮高 ≥ 吃水 + 安全富余` 的连续达标窗口（**端点恰好达标也纳入**）；
 - 每个达标窗口的**结束时刻减去通航时长**得到**可出发时段**，不足所需时长的窗口舍弃；
 - 返回**全部可出发时段**和**最早出发时刻**；
-- 预报点更正（同一时刻重复提交即覆盖）后，查询自动按最新数据实时重算。
+- 预报点更正（同一时刻重复提交即覆盖）后，查询自动按最新数据实时重算；
+- **单向航道预约**：在请求方允许的出发时刻范围内，按最新预报安排**最早**出发时刻，
+  使整个通航过程不与该港口现有**有效预约**重叠（两船**首尾相接允许**）；
+  无可用时刻返回 **409** 且不写入；同港口并发创建原子地“检查 + 落库”，杜绝双重占用；
+- 已落库预约记录的是排定的确定时刻，**预报更正不追溯调整或取消已有预约**。
 
 ## 快速开始（单条命令）
 
@@ -17,6 +21,8 @@ docker compose up --build
 ```
 
 该命令自动完成：依赖安装 → SQLite 数据库初始化（服务启动时幂等建表）→ 启动服务。
+
+启动后访问：
 
 - **API 地址**：http://localhost:8000
 - **交互式文档（Swagger UI）**：http://localhost:8000/docs
@@ -45,6 +51,9 @@ docker compose up --build
 | `PUT` | `/ports/{id}/tide-forecasts` | 批量录入/更正潮高预报点（同一时刻重复提交即覆盖） |
 | `GET` | `/ports/{id}/tide-forecasts` | 查看当前预报点 |
 | `POST` | `/ports/{id}/windows` | 提交吃水、安全富余、通航时长，计算可出发时段 |
+| `POST` | `/ports/{id}/reservations` | 创建单向航道预约（自动排最早出发时刻） |
+| `GET` | `/ports/{id}/reservations` | 按港口列出**有效**预约（按出发时刻升序） |
+| `DELETE` | `/reservations/{id}` | 取消预约（释放航道占用） |
 
 ### 完整示例
 
@@ -101,6 +110,91 @@ curl -X POST http://localhost:8000/ports/1/windows \
 - `duration_minutes` 必须为**正数**（`> 0`），否则返回 422；
 - `draft`、`safety_margin` 必须为非负数；
 - 预报点不足 2 个（无插值区间）或全程不达标时，返回空窗口列表与 `earliest_departure: null`。
+
+## 单向航道预约
+
+创建预约时提交：船名、吃水、安全富余、通航分钟数，以及**允许出发的起止时刻**
+（`allowed_departure_from` ≤ `allowed_departure_to`，含端点；均按上面的 UTC 规则解释）。
+
+排程规则：
+
+1. 基于该港口**最新预报**计算潮汐可出发时段（同 `/windows`）；
+2. 与请求的允许出发范围取交集；
+3. 在其中选择**最早**的出发时刻，使整个通航区间 `[出发, 出发 + 通航时长]`
+   不与该港口任何**有效预约**重叠——两船**首尾相接允许**
+   （上一条 01:00 结束，下一条 01:00 出发合法）；
+4. 无可用时刻返回 **409 Conflict** 且**不写入**任何数据。
+
+同港口并发创建：服务先按港口在进程内串行化，再于 SQLite `BEGIN IMMEDIATE`
+写事务中原子地完成“检查最新预报与现有预约 → 插入”，并设置 `busy_timeout`
+让并发请求排队等待，因此不会产生双重占用。
+
+```bash
+# 沿用上面的示例港：可出发时段 [00:36, 04:24]，甲船申请 00:00–04:24 出发
+curl -X POST http://localhost:8000/ports/1/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"ship_name": "甲船",
+       "draft": 5.0,
+       "safety_margin": 0.5,
+       "duration_minutes": 60,
+       "allowed_departure_from": "2026-09-24T00:00:00Z",
+       "allowed_departure_to":   "2026-09-24T04:24:00Z"}'
+```
+
+响应（`201 Created`；潮汐最早 00:36 可出发，排定 00:36–01:36）：
+
+```json
+{
+  "id": 1,
+  "port_id": 1,
+  "ship_name": "甲船",
+  "draft": 5.0,
+  "safety_margin": 0.5,
+  "duration_minutes": 60.0,
+  "allowed_departure_from": "2026-09-24T00:00:00+00:00",
+  "allowed_departure_to": "2026-09-24T04:24:00+00:00",
+  "departure_start": "2026-09-24T00:36:00+00:00",
+  "departure_end": "2026-09-24T01:36:00+00:00",
+  "status": "active",
+  "created_at": "2026-09-24T10:00:00.000000+00:00",
+  "canceled_at": null
+}
+```
+
+```bash
+# 乙船只允许在 01:30 前出发：01:30 出发会在 [01:30,02:30] 与甲船重叠 → 409
+curl -i -X POST http://localhost:8000/ports/1/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"ship_name": "乙船",
+       "draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60,
+       "allowed_departure_from": "2026-09-24T00:00:00Z",
+       "allowed_departure_to":   "2026-09-24T01:30:00Z"}'
+# HTTP/1.1 409 Conflict
+# {"detail":"允许出发范围内无可用时刻（潮高不足或与现有预约冲突）"}
+
+# 丙船允许到 04:24：最早可紧随甲船 01:36 出发（首尾相接）
+curl -X POST http://localhost:8000/ports/1/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"ship_name": "丙船",
+       "draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60,
+       "allowed_departure_from": "2026-09-24T00:00:00Z",
+       "allowed_departure_to":   "2026-09-24T04:24:00Z"}'
+# → departure_start 01:36，departure_end 02:36
+
+# 列出该港口全部有效预约（已取消的不在其中）
+curl http://localhost:8000/ports/1/reservations
+
+# 取消预约 1：立即释放占用；取消未知预约 404，重复取消 409
+curl -X DELETE http://localhost:8000/reservations/1
+```
+
+说明：
+
+- **预报更正不追溯**：预约创建后即固定 `departure_start/end`；之后更正预报点，
+  已有预约既不会被自动取消，时刻也不会变化（仅影响此后新建预约的排程）；
+- 取消后的预约状态变为 `cancelled`，不再占用航道、不出现在有效列表中；
+- 创建预约的校验与 `/windows` 一致（通航时长为正、吃水/富余非负），
+  此外允许出发范围起止颠倒返回 422，港口不存在返回 404。
 
 ## 本地开发（不用 Docker）
 

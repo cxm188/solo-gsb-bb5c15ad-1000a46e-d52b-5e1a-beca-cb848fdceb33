@@ -7,9 +7,23 @@
 """
 import os
 import sqlite3
+import threading
+from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "tide.db")
+
+# 同港预约并发创建时，进程内先按港口串行化，再由 BEGIN IMMEDIATE
+# 保证跨进程/跨连接的原子性，避免双重占用。
+_port_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
+
+
+def port_lock(port_id: int) -> threading.Lock:
+    """返回某港口对应的进程内互斥锁。"""
+    return _port_locks[port_id]
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ports (
@@ -25,6 +39,27 @@ CREATE TABLE IF NOT EXISTS tide_forecasts (
     tide_height   REAL    NOT NULL,           -- 潮高（米，相对海图基准面）
     PRIMARY KEY (port_id, forecast_time)      -- 同一时刻重复录入即“更正”
 );
+
+CREATE TABLE IF NOT EXISTS reservations (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    port_id                INTEGER NOT NULL
+        REFERENCES ports(id) ON DELETE CASCADE,
+    ship_name              TEXT    NOT NULL,
+    draft                  REAL    NOT NULL,
+    safety_margin          REAL    NOT NULL,
+    duration_minutes       REAL    NOT NULL,   -- 通航时长（分钟，正数）
+    allowed_departure_from TEXT   NOT NULL,   -- 允许出发范围起点（ISO 8601 UTC）
+    allowed_departure_to   TEXT   NOT NULL,   -- 允许出发范围终点（ISO 8601 UTC）
+    departure_start        TEXT   NOT NULL,   -- 排定的出发时刻（ISO 8601 UTC）
+    departure_end          TEXT   NOT NULL,   -- 出发时刻 + 通航时长（ISO 8601 UTC）
+    status                 TEXT   NOT NULL DEFAULT 'active',
+                                                   -- active / cancelled
+    created_at             TEXT   NOT NULL,
+    canceled_at            TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_port_status
+    ON reservations (port_id, status, departure_start);
 """
 
 
@@ -39,11 +74,35 @@ def init_db() -> None:
 
 def get_db():
     """FastAPI 依赖：每个请求一个 SQLite 连接，正常返回时提交。"""
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
     try:
         yield conn
         conn.commit()
+    finally:
+        conn.close()
+
+
+@contextmanager
+def locked_reservation_tx() -> Iterator[sqlite3.Connection]:
+    """预约创建专用：以 BEGIN IMMEDIATE 立即获取写锁的事务连接。
+
+    检查（最新预报 + 有效预约）与插入在同一写事务内完成，
+    提交前其他连接无法开始写事务，从而原子地避免双重占用；
+    busy_timeout 使并发请求排队等待而非立即报 SQLITE_BUSY。
+    """
+    conn = sqlite3.connect(DATABASE_PATH, timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
