@@ -1,7 +1,7 @@
 """核心窗口计算算法的单元测试（仅标准库）。"""
 from datetime import datetime, timedelta, timezone
 
-from app.tides import departure_windows, sufficient_depth_windows
+from app.tides import departure_windows, earliest_departure_slot, sufficient_depth_windows
 
 BASE = datetime(2026, 9, 24, tzinfo=timezone.utc)
 
@@ -94,3 +94,63 @@ def test_window_clipped_at_forecast_coverage():
     # 全程达标时窗口就是预报覆盖时段本身，不外推
     windows = sufficient_depth_windows(pts(3, 4, 3), reference_depth=3.0, required_depth=5.0)
     assert windows == [(BASE.timestamp(), (BASE + timedelta(hours=2)).timestamp())]
+
+
+# ---- earliest_departure_slot：预约排程 ----
+
+
+def test_slot_without_occupation():
+    # 无占用时取可出发时段与请求范围的交集起点
+    windows = [(BASE + timedelta(minutes=30), BASE + timedelta(hours=2))]
+    t = earliest_departure_slot(windows, BASE, BASE + timedelta(hours=3), 1800, [])
+    assert t == BASE + timedelta(minutes=30)
+
+
+def test_slot_respects_not_before():
+    # 请求范围比可出发时段更晚，按 not_before 出发
+    windows = [(BASE, BASE + timedelta(hours=2))]
+    t = earliest_departure_slot(windows, BASE + timedelta(hours=1), BASE + timedelta(hours=3), 1800, [])
+    assert t == BASE + timedelta(hours=1)
+
+
+def test_slot_pushed_past_occupied_back_to_back():
+    # 与已有预约重叠时顺延到其结束时刻（首尾相接允许）
+    windows = [(BASE, BASE + timedelta(hours=4))]
+    occupied = [(BASE, BASE + timedelta(hours=1))]
+    t = earliest_departure_slot(windows, BASE, BASE + timedelta(hours=4), 3600, occupied)
+    assert t == BASE + timedelta(hours=1)
+
+
+def test_slot_uses_gap_between_occupied():
+    # 两段占用之间恰好有 1 小时空档（两端均首尾相接）
+    windows = [(BASE, BASE + timedelta(hours=6))]
+    occupied = [
+        (BASE + timedelta(hours=2), BASE + timedelta(hours=3)),
+        (BASE, BASE + timedelta(hours=1)),
+    ]
+    t = earliest_departure_slot(windows, BASE, BASE + timedelta(hours=6), 3600, occupied)
+    assert t == BASE + timedelta(hours=1)
+
+
+def test_slot_none_when_fully_occupied():
+    windows = [(BASE, BASE + timedelta(hours=2))]
+    occupied = [(BASE, BASE + timedelta(hours=3))]
+    assert earliest_departure_slot(windows, BASE, BASE + timedelta(hours=2), 3600, occupied) is None
+
+
+def test_slot_none_when_request_range_outside_windows():
+    windows = [(BASE, BASE + timedelta(hours=2))]
+    assert earliest_departure_slot(
+        windows, BASE + timedelta(hours=3), BASE + timedelta(hours=4), 3600, []
+    ) is None
+
+
+def test_slot_falls_through_to_next_window():
+    # 第一个可出发时段被占满时使用下一个
+    windows = [
+        (BASE, BASE + timedelta(hours=1)),
+        (BASE + timedelta(hours=2), BASE + timedelta(hours=4)),
+    ]
+    occupied = [(BASE, BASE + timedelta(hours=2))]
+    t = earliest_departure_slot(windows, BASE, BASE + timedelta(hours=6), 3600, occupied)
+    assert t == BASE + timedelta(hours=2)

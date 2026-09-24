@@ -1,9 +1,16 @@
 """API 端到端测试（需要 fastapi/httpx，容器内或安装依赖后运行）。"""
+from datetime import datetime
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app import database
 from app.main import app
+
+
+def _norm(s: str) -> str:
+    """规范化 ISO 8601 时刻字符串，使 Z 与 +00:00 等等价表示可比较。"""
+    return datetime.fromisoformat(s).isoformat()
 
 
 @pytest.fixture()
@@ -45,8 +52,8 @@ def test_full_flow_and_correction_recompute(client):
     assert r.status_code == 200
     body = r.json()
     assert body["required_depth"] == 5.5
-    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"
-    assert body["windows"] == [
+    assert _norm(body["earliest_departure"]) == "2026-09-24T00:36:00+00:00"
+    assert [{k: _norm(v) for k, v in w.items()} for w in body["windows"]] == [
         {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T04:24:00+00:00"}
     ]
 

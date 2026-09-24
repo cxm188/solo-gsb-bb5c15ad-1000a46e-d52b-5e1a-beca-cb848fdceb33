@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 _EPS = 1e-9  # 浮点容差，保证“恰好达标”的端点被纳入
 
@@ -98,3 +98,38 @@ def departure_windows(
 def _to_utc(ts: float) -> datetime:
     """Unix 秒转 UTC datetime，四舍五入到整秒避免浮点噪声。"""
     return datetime.fromtimestamp(round(ts), tz=timezone.utc)
+
+
+def earliest_departure_slot(
+    windows: list[tuple[datetime, datetime]],
+    not_before: datetime,
+    not_after: datetime,
+    duration_seconds: float,
+    occupied: list[tuple[datetime, datetime]],
+) -> datetime | None:
+    """在可出发时段与请求范围 [not_before, not_after] 的交集内求最早出发时刻。
+
+    要求整个通航过程 [t, t + duration] 不与任何占用区间 (start, end) 重叠；
+    首尾相接（t == end 或 t + duration == start）不算重叠。
+    所有可出发时段都放不下时返回 None。
+
+    windows 为 departure_windows() 返回的可出发时段（按时间升序）；
+    occupied 为已有有效预约的 (出发时刻, 通航结束时刻) 区间，顺序任意。
+    """
+    duration = timedelta(seconds=duration_seconds)
+    busy = sorted(occupied)  # 按占用起点升序
+    for win_start, win_end in windows:
+        lo = max(win_start, not_before)  # 与请求范围求交
+        hi = min(win_end, not_after)
+        if lo > hi:
+            continue
+        t = lo
+        for occ_start, occ_end in busy:
+            if occ_end <= t:
+                continue  # 占用在 t 之前结束（含相接），不影响
+            if occ_start >= t + duration:
+                break  # 占用在 [t, t+duration] 之后开始（含相接），后续区间更晚
+            t = occ_end  # 重叠：推迟到该占用区间的结束时刻（首尾相接允许）
+        if t <= hi:
+            return t
+    return None

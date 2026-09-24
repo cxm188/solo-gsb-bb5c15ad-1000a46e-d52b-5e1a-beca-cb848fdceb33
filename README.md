@@ -1,6 +1,6 @@
-# 港口潮汐通航窗口 API
+# 港口潮汐通航窗口与预约 API
 
-基于 **Python + FastAPI + SQLite** 的港口潮汐通航窗口计算服务。
+基于 **Python + FastAPI + SQLite** 的港口潮汐通航窗口计算与单向航道预约服务。
 
 - 录入港口的**潮高预报点**与**航道基准水深**；
 - 船舶提交**吃水**、**安全富余**和**正数通航时长**；
@@ -8,7 +8,11 @@
   `水深 = 基准水深 + 潮高 ≥ 吃水 + 安全富余` 的连续达标窗口（**端点恰好达标也纳入**）；
 - 每个达标窗口的**结束时刻减去通航时长**得到**可出发时段**，不足所需时长的窗口舍弃；
 - 返回**全部可出发时段**和**最早出发时刻**；
-- 预报点更正（同一时刻重复提交即覆盖）后，查询自动按最新数据实时重算。
+- 预报点更正（同一时刻重复提交即覆盖）后，查询自动按最新数据实时重算；
+- **单向航道预约**：在允许出发范围内按最新预报安排**最早可出发时刻**，
+  整个通航过程不与该港口有效预约重叠（**首尾相接允许**）；
+  无可用时刻返回 **409 且不写入**；同港口并发创建在**同一事务内原子地检查并落库**，
+  不会双重占用；预约创建后即固定，**预报更正不追溯取消已有预约**。
 
 ## 快速开始（单条命令）
 
@@ -45,6 +49,9 @@ docker compose up --build
 | `PUT` | `/ports/{id}/tide-forecasts` | 批量录入/更正潮高预报点（同一时刻重复提交即覆盖） |
 | `GET` | `/ports/{id}/tide-forecasts` | 查看当前预报点 |
 | `POST` | `/ports/{id}/windows` | 提交吃水、安全富余、通航时长，计算可出发时段 |
+| `POST` | `/ports/{id}/reservations` | 创建单向航道预约：在允许出发范围内安排最早可出发时刻；无可用时刻返回 409 |
+| `GET` | `/ports/{id}/reservations` | 按出发时刻升序列出该港口的有效预约 |
+| `DELETE` | `/ports/{id}/reservations/{reservation_id}` | 取消预约（释放占用时段；不存在或已取消返回 404） |
 
 ### 完整示例
 
@@ -96,11 +103,74 @@ curl -X POST http://localhost:8000/ports/1/windows \
 # → {"windows": [], "earliest_departure": null, ...}（峰值水深仅 5.5，窗口长度不足 60 分钟）
 ```
 
+### 预约示例
+
+```bash
+# 1. 创建预约：允许 00:00–06:00（UTC）之间出发，需要 60 分钟连续通航
+curl -X POST http://localhost:8000/ports/1/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"vessel_name": "远洋号", "draft": 5.0, "safety_margin": 0.5,
+       "duration_minutes": 60,
+       "not_before": "2026-09-24T00:00:00Z",
+       "not_after": "2026-09-24T06:00:00Z"}'
+```
+
+响应 `201`（出发时刻取请求范围与最新预报可出发时段的交集内最早值，
+本例为达标窗口起点 00:36）：
+
+```json
+{
+  "id": 1,
+  "port_id": 1,
+  "vessel_name": "远洋号",
+  "draft": 5.0,
+  "safety_margin": 0.5,
+  "duration_minutes": 60.0,
+  "not_before": "2026-09-24T00:00:00Z",
+  "not_after": "2026-09-24T06:00:00Z",
+  "departure_time": "2026-09-24T00:36:00Z",
+  "arrival_time": "2026-09-24T01:36:00Z",
+  "status": "active",
+  "created_at": "2026-09-24T12:00:00Z"
+}
+```
+
+```bash
+# 2. 第二艘船同样的请求：自动顺延到 01:36（与上一艘首尾相接）
+curl -X POST http://localhost:8000/ports/1/reservations \
+  -H "Content-Type: application/json" \
+  -d '{"vessel_name": "奋进号", "draft": 5.0, "safety_margin": 0.5,
+       "duration_minutes": 60,
+       "not_before": "2026-09-24T00:00:00Z",
+       "not_after": "2026-09-24T06:00:00Z"}'
+# → departure_time = 2026-09-24T01:36:00Z
+
+# 3. 列出该港口全部有效预约（按出发时刻升序）
+curl http://localhost:8000/ports/1/reservations
+
+# 4. 取消预约（释放其占用时段，之后同一时刻可被新预约使用）
+curl -X DELETE http://localhost:8000/ports/1/reservations/2
+```
+
+### 预约规则
+
+- 出发时刻落在 `[not_before, not_after]` 与**最新预报**可出发时段的交集内，取**最早**值；
+- 整个通航过程 `[departure_time, arrival_time]`（出发时刻 + 通航时长）不与该港口
+  其他**有效预约**重叠，**首尾相接允许**；
+- 没有可用时刻返回 **409**，且不写入任何数据；
+- 检查与落库在**同一事务**内完成（`BEGIN IMMEDIATE` + 写锁等待），
+  同港口并发创建串行执行，不会双重占用；
+- 预约创建后即固定，后续**预报更正不追溯取消**已有预约；
+- 取消为软删除：取消后不再出现在有效预约列表中，其时段立即可被新预约使用；
+  重复取消或取消不存在的预约返回 404。
+
 ### 参数校验
 
 - `duration_minutes` 必须为**正数**（`> 0`），否则返回 422；
 - `draft`、`safety_margin` 必须为非负数；
-- 预报点不足 2 个（无插值区间）或全程不达标时，返回空窗口列表与 `earliest_departure: null`。
+- 预约的 `not_after` 必须不早于 `not_before`，否则返回 422；
+- 预报点不足 2 个（无插值区间）或全程不达标时，窗口查询返回空窗口列表与
+  `earliest_departure: null`，预约创建返回 409。
 
 ## 本地开发（不用 Docker）
 

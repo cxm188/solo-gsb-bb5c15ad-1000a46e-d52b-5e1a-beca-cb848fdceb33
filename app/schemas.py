@@ -53,3 +53,35 @@ class WindowQueryResult(BaseModel):
     duration_minutes: float
     earliest_departure: datetime | None = Field(description="最早可出发时刻；无可出发时段时为 null")
     windows: list[DepartureWindow] = Field(description="全部可出发时段")
+
+
+class ReservationCreate(BaseModel):
+    """创建单向航道预约：在 [not_before, not_after] 内安排最早可出发时刻。"""
+
+    vessel_name: str = Field(min_length=1, max_length=100, description="船名")
+    draft: float = Field(ge=0, description="船舶吃水（米）")
+    safety_margin: float = Field(ge=0, description="安全富余（米）")
+    duration_minutes: float = Field(gt=0, description="所需通航时长（分钟），必须为正数")
+    not_before: datetime = Field(
+        description="允许出发的最早时刻（ISO 8601；无时区信息按 UTC 处理）"
+    )
+    not_after: datetime = Field(
+        description="允许出发的最晚时刻（ISO 8601；无时区信息按 UTC 处理）"
+    )
+
+
+class ReservationOut(BaseModel):
+    id: int
+    port_id: int
+    vessel_name: str
+    draft: float
+    safety_margin: float
+    duration_minutes: float
+    not_before: datetime = Field(description="允许出发的最早时刻（UTC）")
+    not_after: datetime = Field(description="允许出发的最晚时刻（UTC）")
+    departure_time: datetime = Field(description="安排的出发时刻（UTC）")
+    arrival_time: datetime = Field(
+        description="通航结束时刻 = 出发时刻 + 通航时长（UTC），首尾相接允许"
+    )
+    status: str = Field(description="active=有效，cancelled=已取消")
+    created_at: datetime
